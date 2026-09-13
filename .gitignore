@@ -1,0 +1,4 @@
+/target/
+/.trace-search-index/
+*.partial
+*.lock
