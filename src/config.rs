@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::engine::EngineConfig;
+use crate::engine::{EngineConfig, MAX_SEARCH_THREADS};
 
 const MIN_CHECKPOINT_BYTES: u64 = 64 * 1024;
 const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -43,13 +43,17 @@ pub struct Args {
     #[arg(long, env = "TRACE_SEARCH_MAX_READ_LINES", default_value_t = 100_000)]
     pub max_read_lines: u64,
 
-    /// Maximum lines inspected by one search_lines call.
+    /// Worker threads used by one search_lines call; zero selects automatically, maximum 32.
+    #[arg(long, env = "TRACE_SEARCH_THREADS", default_value_t = 0)]
+    pub search_threads: usize,
+
+    /// Approximate aggregate memory budget for concurrent search workers.
     #[arg(
         long,
-        env = "TRACE_SEARCH_MAX_SEARCH_LINES",
-        default_value_t = 10_000_000
+        env = "TRACE_SEARCH_MEMORY_BUDGET_BYTES",
+        default_value_t = 1024 * 1024 * 1024
     )]
-    pub max_search_lines: u64,
+    pub search_memory_budget_bytes: usize,
 
     /// Maximum matches returned by one search_lines call.
     #[arg(long, env = "TRACE_SEARCH_MAX_MATCHES", default_value_t = 10_000)]
@@ -126,8 +130,11 @@ impl Args {
         if self.max_read_lines == 0 {
             bail!("max-read-lines must be greater than zero");
         }
-        if self.max_search_lines == 0 {
-            bail!("max-search-lines must be greater than zero");
+        if self.search_threads > MAX_SEARCH_THREADS {
+            bail!("search-threads must not exceed {MAX_SEARCH_THREADS}");
+        }
+        if self.search_memory_budget_bytes == 0 {
+            bail!("search-memory-budget-bytes must be greater than zero");
         }
         if self.max_matches == 0 {
             bail!("max-matches must be greater than zero");
@@ -169,7 +176,8 @@ impl Args {
             export_root,
             checkpoint_bytes: self.checkpoint_bytes,
             max_read_lines: self.max_read_lines,
-            max_search_lines: self.max_search_lines,
+            search_threads: effective_search_threads(self.search_threads),
+            search_memory_budget_bytes: self.search_memory_budget_bytes,
             max_matches: self.max_matches,
             max_content_bytes: self.max_content_bytes,
             max_line_bytes: self.max_line_bytes,
@@ -191,6 +199,16 @@ impl Args {
         hosts.extend(self.allowed_hosts.iter().cloned());
         hosts.into_iter().collect()
     }
+}
+
+fn effective_search_threads(configured: usize) -> usize {
+    if configured != 0 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8)
 }
 
 fn prepare_directory(path: &Path, label: &str) -> Result<PathBuf> {

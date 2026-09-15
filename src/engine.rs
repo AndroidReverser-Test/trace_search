@@ -4,13 +4,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{Receiver, sync_channel},
     },
     time::Instant,
 };
 
-use memchr::{memchr, memmem};
-use regex::bytes::RegexBuilder;
+use memchr::{memchr_iter, memmem};
+use regex::bytes::{Regex, RegexBuilder};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -20,9 +21,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::index::{self, BuildProgress, IndexConfig, IndexError, LineIndex, SourceDescriptor};
 
-const SEARCH_READER_BYTES: usize = 1024 * 1024;
+const SEARCH_READER_BYTES: usize = 4 * 1024 * 1024;
+const MIN_PARALLEL_SEARCH_BYTES: u64 = 8 * 1024 * 1024;
 const EXPORT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const REGEX_COMPILED_SIZE_LIMIT: usize = 16 * 1024 * 1024;
+pub const MAX_SEARCH_THREADS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -30,7 +33,8 @@ pub struct EngineConfig {
     pub export_root: PathBuf,
     pub checkpoint_bytes: u64,
     pub max_read_lines: u64,
-    pub max_search_lines: u64,
+    pub search_threads: usize,
+    pub search_memory_budget_bytes: usize,
     pub max_matches: u64,
     pub max_content_bytes: usize,
     pub max_line_bytes: usize,
@@ -51,6 +55,8 @@ pub enum EngineError {
     NotReady(String),
     #[error("blocking task failed: {0}")]
     Join(String),
+    #[error("search was cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -78,7 +84,7 @@ pub struct SearchLinesRequest {
     pub pattern: String,
     /// One-based first line to inspect.
     pub start_line: u64,
-    /// Maximum number of lines to inspect.
+    /// Maximum number of lines to inspect, supplied entirely by the caller.
     pub max_scan_lines: u64,
     /// Maximum matching lines to return. Defaults to 100.
     pub max_matches: Option<u64>,
@@ -201,7 +207,15 @@ pub struct FileEngine {
     state: RwLock<ActiveState>,
     transition: Mutex<()>,
     next_job_id: AtomicU64,
-    query_slots: Semaphore,
+    query_slots: Arc<Semaphore>,
+}
+
+struct CancelSearchOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelSearchOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl FileEngine {
@@ -212,7 +226,7 @@ impl FileEngine {
             state: RwLock::new(ActiveState::Empty),
             transition: Mutex::new(()),
             next_job_id: AtomicU64::new(1),
-            query_slots: Semaphore::new(query_concurrency),
+            query_slots: Arc::new(Semaphore::new(query_concurrency)),
         }
     }
 
@@ -419,7 +433,10 @@ impl FileEngine {
         }
     }
 
-    pub async fn read_lines(&self, request: ReadLinesRequest) -> Result<ReadLinesResponse> {
+    pub async fn read_lines(
+        self: &Arc<Self>,
+        request: ReadLinesRequest,
+    ) -> Result<ReadLinesResponse> {
         if request.start_line == 0 {
             return Err(EngineError::InvalidRequest(
                 "start_line is one-based and must be at least 1".to_owned(),
@@ -432,31 +449,31 @@ impl FileEngine {
             )));
         }
 
-        let opened = self.ready_file().await?;
-        let _permit = self
+        let permit = self
             .query_slots
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| EngineError::NotReady("server is shutting down".to_owned()))?;
+        let opened = self.ready_file().await?;
         let max_content_bytes = self.config.max_content_bytes;
-        let opened_for_work = opened.clone();
-        let result =
-            run_blocking(move || read_lines_blocking(&opened_for_work, request, max_content_bytes))
-                .await?;
-        self.finish_query(&opened, result).await
+        let engine = Arc::clone(self);
+        run_blocking(move || {
+            let _permit = permit;
+            let result = read_lines_blocking(&opened, request, max_content_bytes);
+            engine.finish_query_blocking(&opened, result)
+        })
+        .await?
     }
 
-    pub async fn search_lines(&self, request: SearchLinesRequest) -> Result<SearchLinesResponse> {
+    pub async fn search_lines(
+        self: &Arc<Self>,
+        request: SearchLinesRequest,
+    ) -> Result<SearchLinesResponse> {
         if request.start_line == 0 {
             return Err(EngineError::InvalidRequest(
                 "start_line is one-based and must be at least 1".to_owned(),
             ));
-        }
-        if request.max_scan_lines > self.config.max_search_lines {
-            return Err(EngineError::InvalidRequest(format!(
-                "max_scan_lines exceeds server limit {}",
-                self.config.max_search_lines
-            )));
         }
         if request.pattern.is_empty() {
             return Err(EngineError::InvalidRequest(
@@ -477,29 +494,39 @@ impl FileEngine {
             )));
         }
 
-        let opened = self.ready_file().await?;
-        let _permit = self
+        let permit = self
             .query_slots
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| EngineError::NotReady("server is shutting down".to_owned()))?;
+        let opened = self.ready_file().await?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelSearchOnDrop(cancellation.clone());
         let max_line_bytes = self.config.max_line_bytes;
         let max_content_bytes = self.config.max_content_bytes;
-        let opened_for_work = opened.clone();
-        let result = run_blocking(move || {
-            search_lines_blocking(
-                &opened_for_work,
+        let search_threads = self.effective_search_threads();
+        let engine = Arc::clone(self);
+        run_blocking(move || {
+            let _permit = permit;
+            let result = search_lines_blocking(
+                &opened,
                 request,
                 requested_matches,
                 max_line_bytes,
                 max_content_bytes,
-            )
+                search_threads,
+                &cancellation,
+            );
+            engine.finish_query_blocking(&opened, result)
         })
-        .await?;
-        self.finish_query(&opened, result).await
+        .await?
     }
 
-    pub async fn export_lines(&self, request: ExportLinesRequest) -> Result<ExportLinesResponse> {
+    pub async fn export_lines(
+        self: &Arc<Self>,
+        request: ExportLinesRequest,
+    ) -> Result<ExportLinesResponse> {
         if request.start_line == 0 {
             return Err(EngineError::InvalidRequest(
                 "start_line is one-based and must be at least 1".to_owned(),
@@ -517,18 +544,21 @@ impl FileEngine {
             ));
         }
 
-        let opened = self.ready_file().await?;
-        let _permit = self
+        let permit = self
             .query_slots
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| EngineError::NotReady("server is shutting down".to_owned()))?;
+        let opened = self.ready_file().await?;
         let export_root = self.config.export_root.clone();
-        let opened_for_work = opened.clone();
-        let result =
-            run_blocking(move || export_lines_blocking(&opened_for_work, request, &export_root))
-                .await?;
-        self.finish_query(&opened, result).await
+        let engine = Arc::clone(self);
+        run_blocking(move || {
+            let _permit = permit;
+            let result = export_lines_blocking(&opened, request, &export_root);
+            engine.finish_query_blocking(&opened, result)
+        })
+        .await?
     }
 
     fn index_config(&self) -> IndexConfig {
@@ -536,6 +566,17 @@ impl FileEngine {
             directory: self.config.index_dir.clone(),
             checkpoint_bytes: self.config.checkpoint_bytes,
         }
+    }
+
+    fn effective_search_threads(&self) -> usize {
+        let configured = self.config.search_threads.clamp(1, MAX_SEARCH_THREADS);
+        let per_query_budget =
+            self.config.search_memory_budget_bytes / self.config.query_concurrency.max(1);
+        let worst_case_worker_bytes = SEARCH_READER_BYTES
+            .saturating_add(self.config.max_line_bytes)
+            .saturating_add(self.config.max_content_bytes);
+        let memory_limited = (per_query_budget / worst_case_worker_bytes.max(1)).max(1);
+        configured.min(memory_limited)
     }
 
     async fn finish_index(
@@ -615,10 +656,16 @@ impl FileEngine {
         }
     }
 
-    async fn finish_query<T>(&self, opened: &Arc<OpenedFile>, result: Result<T>) -> Result<T> {
-        if matches!(&result, Err(EngineError::Index(IndexError::SourceChanged))) {
-            self.mark_failed_if_current(opened, "the source file changed".to_owned())
-                .await;
+    fn finish_query_blocking<T>(&self, opened: &Arc<OpenedFile>, result: Result<T>) -> Result<T> {
+        if let Err(EngineError::Index(error)) = &result {
+            let mut state = self.state.blocking_write();
+            if matches!(&*state, ActiveState::Ready(current) if Arc::ptr_eq(current, opened)) {
+                *state = ActiveState::Failed(FailedState {
+                    source: Some(opened.source.clone()),
+                    index_path: Some(opened.index.index_path.clone()),
+                    error: error.to_string(),
+                });
+            }
         }
         result
     }
@@ -696,25 +743,241 @@ fn read_lines_blocking(
     })
 }
 
+#[derive(Clone)]
+enum SearchMatcher<'pattern> {
+    Literal(Arc<memmem::Finder<'pattern>>),
+    Regex(Regex),
+}
+
+impl SearchMatcher<'_> {
+    fn is_match(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Literal(finder) => finder.find(bytes).is_some(),
+            Self::Regex(regex) => regex.is_match(bytes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchChunk {
+    start_line: u64,
+    end_line: u64,
+    start_offset: u64,
+    end_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchScanOptions {
+    source_size: u64,
+    max_line_bytes: usize,
+    max_content_bytes: usize,
+}
+
+enum SearchEvent {
+    Match {
+        line: u64,
+        content: String,
+        lossy_utf8: bool,
+    },
+    OversizedMatch {
+        line: u64,
+    },
+}
+
+enum SearchWorkerEvent {
+    Search(SearchEvent),
+    Complete,
+    Error(EngineError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchScanStatus {
+    Complete,
+    Stopped,
+}
+
+struct SearchAccumulator {
+    start_line: u64,
+    scan_end: u64,
+    total_lines: u64,
+    max_matches: u64,
+    max_content_bytes: usize,
+    scanned_lines: u64,
+    matches: Vec<SearchMatch>,
+    content_bytes: usize,
+    lossy_utf8: bool,
+    next_line: Option<u64>,
+    stopped_early: bool,
+    match_limit_reached: bool,
+    content_limit_reached: bool,
+}
+
+impl SearchAccumulator {
+    fn new(
+        start_line: u64,
+        scan_end: u64,
+        total_lines: u64,
+        max_matches: u64,
+        max_content_bytes: usize,
+    ) -> Self {
+        Self {
+            start_line,
+            scan_end,
+            total_lines,
+            max_matches,
+            max_content_bytes,
+            scanned_lines: 0,
+            matches: Vec::new(),
+            content_bytes: 0,
+            lossy_utf8: false,
+            next_line: None,
+            stopped_early: false,
+            match_limit_reached: false,
+            content_limit_reached: false,
+        }
+    }
+
+    fn accept(&mut self, event: SearchEvent) -> Result<bool> {
+        match event {
+            SearchEvent::Match {
+                line,
+                content,
+                lossy_utf8,
+            } => {
+                let next_content_bytes = self.content_bytes.saturating_add(content.len());
+                if next_content_bytes > self.max_content_bytes {
+                    if self.matches.is_empty() {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "matching line {line} exceeds max-content-bytes {}",
+                            self.max_content_bytes
+                        )));
+                    }
+                    self.stop_for_content_limit(line);
+                    return Ok(false);
+                }
+
+                self.content_bytes = next_content_bytes;
+                self.lossy_utf8 |= lossy_utf8;
+                self.matches.push(SearchMatch { line, content });
+                if self.matches.len() as u64 >= self.max_matches {
+                    self.scanned_lines = line - self.start_line + 1;
+                    self.next_line = (line < self.total_lines).then_some(line + 1);
+                    self.stopped_early = true;
+                    self.match_limit_reached = self.next_line.is_some();
+                    return Ok(false);
+                }
+            }
+            SearchEvent::OversizedMatch { line } => {
+                if self.matches.is_empty() {
+                    return Err(EngineError::InvalidRequest(format!(
+                        "matching line {line} exceeds max-content-bytes {}",
+                        self.max_content_bytes
+                    )));
+                }
+                self.stop_for_content_limit(line);
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn stop_for_content_limit(&mut self, line: u64) {
+        self.scanned_lines = line - self.start_line;
+        self.next_line = Some(line);
+        self.stopped_early = true;
+        self.content_limit_reached = true;
+    }
+
+    fn complete_chunk(&mut self, end_line: u64) {
+        self.scanned_lines = end_line - self.start_line;
+    }
+
+    fn into_response(self, regex_mode: bool) -> SearchLinesResponse {
+        let next_line = if self.stopped_early {
+            self.next_line
+        } else if self.scan_end <= self.total_lines {
+            Some(self.scan_end)
+        } else {
+            None
+        };
+        let eof = next_line.is_none();
+
+        SearchLinesResponse {
+            mode: if regex_mode {
+                "regex".to_owned()
+            } else {
+                "literal".to_owned()
+            },
+            start_line: self.start_line,
+            scanned_lines: self.scanned_lines,
+            matches: self.matches,
+            lossy_utf8: self.lossy_utf8,
+            next_line,
+            eof,
+            scan_limit_reached: !self.stopped_early && !eof,
+            match_limit_reached: self.match_limit_reached,
+            content_limit_reached: self.content_limit_reached,
+        }
+    }
+}
+
 fn search_lines_blocking(
     opened: &OpenedFile,
     request: SearchLinesRequest,
     max_matches: u64,
     max_line_bytes: usize,
     max_content_bytes: usize,
+    search_threads: usize,
+    cancellation: &AtomicBool,
 ) -> Result<SearchLinesResponse> {
     index::ensure_source_unchanged(&opened.source)?;
+    let result = search_lines_snapshot(
+        opened,
+        request,
+        max_matches,
+        max_line_bytes,
+        max_content_bytes,
+        search_threads,
+        cancellation,
+    );
+    match result {
+        Ok(response) => {
+            index::ensure_source_unchanged(&opened.source)?;
+            Ok(response)
+        }
+        Err(error) => match index::ensure_source_unchanged(&opened.source) {
+            Ok(()) => Err(error),
+            Err(source_error) => Err(source_error.into()),
+        },
+    }
+}
+
+fn search_lines_snapshot(
+    opened: &OpenedFile,
+    request: SearchLinesRequest,
+    max_matches: u64,
+    max_line_bytes: usize,
+    max_content_bytes: usize,
+    search_threads: usize,
+    cancellation: &AtomicBool,
+) -> Result<SearchLinesResponse> {
+    if cancellation.load(Ordering::Relaxed) {
+        return Err(EngineError::Cancelled);
+    }
     let selected = selected_line_count(
         opened.index.line_count,
         request.start_line,
         request.max_scan_lines,
     )?;
-    let scan_end = request.start_line + selected;
+    let scan_end = request
+        .start_line
+        .checked_add(selected)
+        .ok_or_else(|| EngineError::InvalidRequest("search line range overflows u64".to_owned()))?;
     let regex_mode = request.regex.unwrap_or(false);
     let case_sensitive = request.case_sensitive.unwrap_or(true);
-    let literal_finder =
-        (!regex_mode && case_sensitive).then(|| memmem::Finder::new(request.pattern.as_bytes()));
-    let regex_matcher = if literal_finder.is_none() {
+    let matcher = if !regex_mode && case_sensitive {
+        SearchMatcher::Literal(Arc::new(memmem::Finder::new(request.pattern.as_bytes())))
+    } else {
         let expression = if regex_mode {
             request.pattern.clone()
         } else {
@@ -724,108 +987,405 @@ fn search_lines_blocking(
         builder
             .case_insensitive(!case_sensitive)
             .size_limit(REGEX_COMPILED_SIZE_LIMIT);
-        Some(
+        SearchMatcher::Regex(
             builder
                 .build()
                 .map_err(|error| EngineError::InvalidRequest(format!("invalid regex: {error}")))?,
         )
-    } else {
-        None
     };
+    let mut accumulator = SearchAccumulator::new(
+        request.start_line,
+        scan_end,
+        opened.index.line_count,
+        max_matches,
+        max_content_bytes,
+    );
 
-    let mut file = index::open_random(&opened.source.canonical_path)?;
-    let start_offset = offset_for_line_or_eof(&mut file, &opened.index, request.start_line)?;
-    file.seek(SeekFrom::Start(start_offset))?;
-    let mut reader = BufReader::with_capacity(SEARCH_READER_BYTES, file);
-    let mut line_bytes = Vec::new();
-    let mut matches = Vec::new();
-    let mut line_number = request.start_line;
-    let mut scanned_lines = 0_u64;
-    let mut content_bytes = 0_usize;
-    let mut lossy_utf8 = false;
-    let mut match_limit_reached = false;
-    let mut content_limit_reached = false;
-    let mut resume_line = None;
-
-    while line_number < scan_end {
-        let bytes_read =
-            read_bounded_line(&mut reader, &mut line_bytes, max_line_bytes).map_err(|error| {
-                if error.kind() == io::ErrorKind::InvalidData {
-                    EngineError::InvalidRequest(format!(
-                        "line {line_number} exceeds max-line-bytes {max_line_bytes}"
-                    ))
-                } else {
-                    EngineError::Io(error)
-                }
-            })?;
-        if bytes_read == 0 {
-            return Err(IndexError::SourceChanged.into());
+    if selected != 0 {
+        let mut file = index::open_random(&opened.source.canonical_path)?;
+        let start_offset = offset_for_search_line_or_eof(
+            &mut file,
+            &opened.index,
+            request.start_line,
+            cancellation,
+        )?;
+        let end_offset =
+            locate_search_line_offset(&mut file, &opened.index, scan_end, cancellation)?;
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(EngineError::Cancelled);
         }
+        let chunks = plan_search_chunks(
+            &opened.index,
+            request.start_line,
+            scan_end,
+            start_offset,
+            end_offset,
+            search_threads.max(1),
+        );
+        let options = SearchScanOptions {
+            source_size: opened.source.identity.size,
+            max_line_bytes,
+            max_content_bytes,
+        };
 
-        let content_bytes_slice = without_line_ending(&line_bytes);
-        let is_match = literal_finder
-            .as_ref()
-            .is_some_and(|finder| finder.find(content_bytes_slice).is_some())
-            || regex_matcher
-                .as_ref()
-                .is_some_and(|regex| regex.is_match(content_bytes_slice));
-
-        if is_match {
-            let line_was_lossy = std::str::from_utf8(content_bytes_slice).is_err();
-            let content = String::from_utf8_lossy(content_bytes_slice).into_owned();
-            if content_bytes.saturating_add(content.len()) > max_content_bytes {
-                if matches.is_empty() {
-                    return Err(EngineError::InvalidRequest(format!(
-                        "matching line {line_number} exceeds max-content-bytes {max_content_bytes}"
-                    )));
-                }
-                content_limit_reached = true;
-                resume_line = Some(line_number);
-                break;
+        if chunks.len() == 1 {
+            let chunk = chunks[0];
+            let status = scan_search_chunk(
+                &opened.source.canonical_path,
+                chunk,
+                &matcher,
+                options,
+                cancellation,
+                |event| accumulator.accept(event),
+            )?;
+            if status == SearchScanStatus::Complete {
+                accumulator.complete_chunk(chunk.end_line);
+            } else if !accumulator.stopped_early {
+                return Err(EngineError::Cancelled);
             }
-            content_bytes += content.len();
-            lossy_utf8 |= line_was_lossy;
-            matches.push(SearchMatch {
-                line: line_number,
-                content,
-            });
-        }
-
-        scanned_lines += 1;
-        line_number += 1;
-        if matches.len() as u64 >= max_matches {
-            match_limit_reached = line_number <= opened.index.line_count;
-            break;
+        } else {
+            accumulator = search_chunks_parallel(
+                &opened.source.canonical_path,
+                &chunks,
+                &matcher,
+                options,
+                accumulator,
+                cancellation,
+            )?;
         }
     }
 
-    index::ensure_source_unchanged(&opened.source)?;
-    let next_line = resume_line.or_else(|| {
-        if line_number <= opened.index.line_count {
-            Some(line_number)
-        } else {
-            None
-        }
-    });
-    let eof = next_line.is_none();
-    let scan_limit_reached =
-        !eof && !match_limit_reached && !content_limit_reached && line_number == scan_end;
+    Ok(accumulator.into_response(regex_mode))
+}
 
-    Ok(SearchLinesResponse {
-        mode: if regex_mode {
-            "regex".to_owned()
-        } else {
-            "literal".to_owned()
-        },
-        start_line: request.start_line,
-        scanned_lines,
-        matches,
+fn plan_search_chunks(
+    index: &LineIndex,
+    start_line: u64,
+    end_line: u64,
+    start_offset: u64,
+    end_offset: u64,
+    max_threads: usize,
+) -> Vec<SearchChunk> {
+    let total_bytes = end_offset - start_offset;
+    let byte_limited_chunks = total_bytes.div_ceil(MIN_PARALLEL_SEARCH_BYTES).max(1);
+    let desired_chunks = max_threads
+        .max(1)
+        .min(usize::try_from(byte_limited_chunks).unwrap_or(usize::MAX));
+    if desired_chunks == 1 {
+        return vec![SearchChunk {
+            start_line,
+            end_line,
+            start_offset,
+            end_offset,
+        }];
+    }
+
+    let mut boundaries = Vec::with_capacity(desired_chunks + 1);
+    boundaries.push((start_line, start_offset));
+    let mut entry_index = index
+        .entries
+        .partition_point(|entry| entry.offset <= start_offset);
+
+    for part in 1..desired_chunks {
+        let target_offset =
+            start_offset + ((total_bytes as u128 * part as u128) / desired_chunks as u128) as u64;
+        while entry_index < index.entries.len() && index.entries[entry_index].offset < target_offset
+        {
+            entry_index += 1;
+        }
+        while entry_index < index.entries.len() {
+            let entry = index.entries[entry_index];
+            if entry.line >= end_line || entry.offset >= end_offset {
+                break;
+            }
+            let (last_line, last_offset) = *boundaries.last().expect("initial boundary");
+            if entry.line > last_line && entry.offset > last_offset {
+                boundaries.push((entry.line, entry.offset));
+                entry_index += 1;
+                break;
+            }
+            entry_index += 1;
+        }
+    }
+    boundaries.push((end_line, end_offset));
+
+    boundaries
+        .windows(2)
+        .map(|boundary| SearchChunk {
+            start_line: boundary[0].0,
+            end_line: boundary[1].0,
+            start_offset: boundary[0].1,
+            end_offset: boundary[1].1,
+        })
+        .collect()
+}
+
+fn search_chunks_parallel(
+    source_path: &Path,
+    chunks: &[SearchChunk],
+    matcher: &SearchMatcher<'_>,
+    options: SearchScanOptions,
+    mut accumulator: SearchAccumulator,
+    cancellation: &AtomicBool,
+) -> Result<SearchAccumulator> {
+    std::thread::scope(|scope| {
+        let mut receivers = Vec::with_capacity(chunks.len());
+        for &chunk in chunks {
+            let (sender, receiver) = sync_channel(0);
+            receivers.push(receiver);
+            let matcher = matcher.clone();
+            scope.spawn(move || {
+                let result = scan_search_chunk(
+                    source_path,
+                    chunk,
+                    &matcher,
+                    options,
+                    cancellation,
+                    |event| {
+                        if cancellation.load(Ordering::Relaxed) {
+                            return Ok(false);
+                        }
+                        Ok(sender.send(SearchWorkerEvent::Search(event)).is_ok())
+                    },
+                );
+                if cancellation.load(Ordering::Relaxed) {
+                    return;
+                }
+                match result {
+                    Ok(SearchScanStatus::Complete) => {
+                        let _ = sender.send(SearchWorkerEvent::Complete);
+                    }
+                    Ok(SearchScanStatus::Stopped) => {}
+                    Err(error) => {
+                        let _ = sender.send(SearchWorkerEvent::Error(error));
+                    }
+                }
+            });
+        }
+
+        let result = consume_search_workers(chunks, &receivers, &mut accumulator, cancellation);
+        cancellation.store(true, Ordering::Relaxed);
+        drop(receivers);
+        result.map(|()| accumulator)
+    })
+}
+
+fn consume_search_workers(
+    chunks: &[SearchChunk],
+    receivers: &[Receiver<SearchWorkerEvent>],
+    accumulator: &mut SearchAccumulator,
+    cancellation: &AtomicBool,
+) -> Result<()> {
+    for (&chunk, receiver) in chunks.iter().zip(receivers) {
+        loop {
+            match receiver.recv() {
+                Ok(SearchWorkerEvent::Search(event)) => {
+                    if !accumulator.accept(event)? {
+                        return Ok(());
+                    }
+                }
+                Ok(SearchWorkerEvent::Complete) => {
+                    accumulator.complete_chunk(chunk.end_line);
+                    break;
+                }
+                Ok(SearchWorkerEvent::Error(error)) => return Err(error),
+                Err(_) => {
+                    if cancellation.load(Ordering::Relaxed) {
+                        return Err(EngineError::Cancelled);
+                    }
+                    return Err(EngineError::Join(
+                        "parallel search worker stopped unexpectedly".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_search_chunk<F>(
+    source_path: &Path,
+    chunk: SearchChunk,
+    matcher: &SearchMatcher<'_>,
+    options: SearchScanOptions,
+    cancellation: &AtomicBool,
+    mut emit: F,
+) -> Result<SearchScanStatus>
+where
+    F: FnMut(SearchEvent) -> Result<bool>,
+{
+    let mut file = index::open_sequential(source_path)?;
+    file.seek(SeekFrom::Start(chunk.start_offset))?;
+    let limited = file.take(chunk.end_offset - chunk.start_offset);
+    let mut reader = BufReader::with_capacity(SEARCH_READER_BYTES, limited);
+    let mut partial_line = Vec::new();
+    let mut line_number = chunk.start_line;
+
+    while line_number < chunk.end_line {
+        if cancellation.load(Ordering::Relaxed) {
+            return Ok(SearchScanStatus::Stopped);
+        }
+
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if partial_line.is_empty() {
+                return Err(IndexError::SourceChanged.into());
+            }
+            if chunk.end_offset != options.source_size {
+                return Err(IndexError::Corrupt(
+                    "parallel search chunk ended inside a line".to_owned(),
+                )
+                .into());
+            }
+            if !emit_search_line(
+                &partial_line,
+                line_number,
+                matcher,
+                options.max_content_bytes,
+                &mut emit,
+            )? {
+                return Ok(SearchScanStatus::Stopped);
+            }
+            line_number += 1;
+            partial_line.clear();
+            break;
+        }
+
+        let available_len = available.len();
+        let mut segment_start = 0_usize;
+        let mut completed = false;
+        for newline in memchr_iter(b'\n', available) {
+            let segment_end = newline + 1;
+            let keep_scanning = if partial_line.is_empty() {
+                let line = &available[segment_start..segment_end];
+                ensure_search_line_size(line.len(), line_number, options.max_line_bytes)?;
+                emit_search_line(
+                    line,
+                    line_number,
+                    matcher,
+                    options.max_content_bytes,
+                    &mut emit,
+                )?
+            } else {
+                append_search_line_bytes(
+                    &mut partial_line,
+                    &available[segment_start..segment_end],
+                    line_number,
+                    options.max_line_bytes,
+                )?;
+                let keep_scanning = emit_search_line(
+                    &partial_line,
+                    line_number,
+                    matcher,
+                    options.max_content_bytes,
+                    &mut emit,
+                )?;
+                partial_line.clear();
+                keep_scanning
+            };
+            if !keep_scanning {
+                return Ok(SearchScanStatus::Stopped);
+            }
+
+            line_number += 1;
+            segment_start = segment_end;
+            if line_number == chunk.end_line {
+                completed = true;
+                break;
+            }
+        }
+
+        if completed {
+            let has_unexpected_bytes =
+                segment_start != available_len || reader.get_ref().limit() != 0;
+            reader.consume(available_len);
+            if has_unexpected_bytes {
+                return Err(IndexError::Corrupt(
+                    "parallel search chunk line range does not match its byte range".to_owned(),
+                )
+                .into());
+            }
+            return Ok(SearchScanStatus::Complete);
+        }
+
+        if segment_start < available_len {
+            append_search_line_bytes(
+                &mut partial_line,
+                &available[segment_start..],
+                line_number,
+                options.max_line_bytes,
+            )?;
+        }
+        reader.consume(available_len);
+    }
+
+    if line_number == chunk.end_line {
+        Ok(SearchScanStatus::Complete)
+    } else {
+        Err(IndexError::SourceChanged.into())
+    }
+}
+
+fn ensure_search_line_size(length: usize, line: u64, max_line_bytes: usize) -> Result<()> {
+    if length > max_line_bytes {
+        return Err(EngineError::InvalidRequest(format!(
+            "line {line} exceeds max-line-bytes {max_line_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+fn append_search_line_bytes(
+    line_bytes: &mut Vec<u8>,
+    bytes: &[u8],
+    line: u64,
+    max_line_bytes: usize,
+) -> Result<()> {
+    if bytes.len() > max_line_bytes.saturating_sub(line_bytes.len()) {
+        return Err(EngineError::InvalidRequest(format!(
+            "line {line} exceeds max-line-bytes {max_line_bytes}"
+        )));
+    }
+    line_bytes.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn emit_search_line<F>(
+    line_bytes: &[u8],
+    line: u64,
+    matcher: &SearchMatcher<'_>,
+    max_content_bytes: usize,
+    emit: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(SearchEvent) -> Result<bool>,
+{
+    let content_bytes = without_line_ending(line_bytes);
+    if !matcher.is_match(content_bytes) {
+        return Ok(true);
+    }
+
+    let (content, lossy_utf8) = match std::str::from_utf8(content_bytes) {
+        Ok(content) => {
+            if content.len() > max_content_bytes {
+                emit(SearchEvent::OversizedMatch { line })?;
+                return Ok(false);
+            }
+            (content.to_owned(), false)
+        }
+        Err(_) => {
+            let content = String::from_utf8_lossy(content_bytes);
+            if content.len() > max_content_bytes {
+                emit(SearchEvent::OversizedMatch { line })?;
+                return Ok(false);
+            }
+            (content.into_owned(), true)
+        }
+    };
+    emit(SearchEvent::Match {
+        line,
+        content,
         lossy_utf8,
-        next_line,
-        eof,
-        scan_limit_reached,
-        match_limit_reached,
-        content_limit_reached,
     })
 }
 
@@ -930,30 +1490,29 @@ fn offset_for_line_or_eof(file: &mut File, index: &LineIndex, line: u64) -> Resu
     }
 }
 
-fn read_bounded_line<R: BufRead>(
-    reader: &mut R,
-    output: &mut Vec<u8>,
-    max_bytes: usize,
-) -> io::Result<usize> {
-    output.clear();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(output.len());
-        }
-        let newline = memchr(b'\n', available);
-        let take = newline.map_or(available.len(), |position| position + 1);
-        if output.len().saturating_add(take) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "line exceeds configured byte limit",
-            ));
-        }
-        output.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            return Ok(output.len());
-        }
+fn offset_for_search_line_or_eof(
+    file: &mut File,
+    index: &LineIndex,
+    line: u64,
+    cancellation: &AtomicBool,
+) -> Result<u64> {
+    if index.line_count == 0 && line == 1 {
+        Ok(0)
+    } else {
+        locate_search_line_offset(file, index, line, cancellation)
+    }
+}
+
+fn locate_search_line_offset(
+    file: &mut File,
+    index: &LineIndex,
+    line: u64,
+    cancellation: &AtomicBool,
+) -> Result<u64> {
+    match index::locate_line_offset_cancellable(file, index, line, cancellation) {
+        Ok(offset) => Ok(offset),
+        Err(IndexError::Cancelled) => Err(EngineError::Cancelled),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1027,6 +1586,298 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn plans_byte_balanced_chunks_on_indexed_line_boundaries() {
+        let mib = 1024 * 1024_u64;
+        let index = LineIndex {
+            index_path: PathBuf::new(),
+            source_size: 80 * mib,
+            line_count: 1_000,
+            checkpoint_bytes: 8 * mib,
+            entries: (0..10)
+                .map(|checkpoint| index::IndexEntry {
+                    line: checkpoint * 100 + 1,
+                    offset: checkpoint * 8 * mib,
+                })
+                .collect(),
+        };
+
+        let chunks = plan_search_chunks(&index, 1, 1_001, 0, 80 * mib, 4);
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.first().unwrap().start_line, 1);
+        assert_eq!(chunks.first().unwrap().start_offset, 0);
+        assert_eq!(chunks.last().unwrap().end_line, 1_001);
+        assert_eq!(chunks.last().unwrap().end_offset, 80 * mib);
+        for chunks in chunks.windows(2) {
+            assert_eq!(chunks[0].end_line, chunks[1].start_line);
+            assert_eq!(chunks[0].end_offset, chunks[1].start_offset);
+        }
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.end_offset > chunk.start_offset)
+        );
+    }
+
+    #[test]
+    fn search_thread_count_respects_memory_budget() {
+        let engine = FileEngine::new(EngineConfig {
+            index_dir: PathBuf::new(),
+            export_root: PathBuf::new(),
+            checkpoint_bytes: 8 * 1024 * 1024,
+            max_read_lines: 1,
+            search_threads: 8,
+            search_memory_budget_bytes: SEARCH_READER_BYTES * 4,
+            max_matches: 1,
+            max_content_bytes: SEARCH_READER_BYTES,
+            max_line_bytes: SEARCH_READER_BYTES,
+            max_pattern_bytes: 1,
+            max_export_lines: 1,
+            query_concurrency: 2,
+        });
+        assert_eq!(engine.effective_search_threads(), 1);
+    }
+
+    #[test]
+    fn parallel_search_merges_in_order_and_preserves_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("parallel.log");
+        std::fs::write(
+            &source_path,
+            b"hit one\r\nskip\nhit two\nskip\nhit three\nhit \xff",
+        )
+        .unwrap();
+        let source = index::inspect_source(&source_path).unwrap();
+        let index_config = IndexConfig {
+            directory: temp.path().join("indexes"),
+            checkpoint_bytes: 8,
+        };
+        let progress = BuildProgress::new(CancellationToken::new());
+        let line_index = index::build_or_load(&source, &index_config, &progress, false).unwrap();
+        let mut file = index::open_random(&source.canonical_path).unwrap();
+        let boundaries = [1, 3, 5, 7].map(|line| {
+            (
+                line,
+                index::locate_line_offset(&mut file, &line_index, line).unwrap(),
+            )
+        });
+        let chunks = boundaries
+            .windows(2)
+            .map(|boundary| SearchChunk {
+                start_line: boundary[0].0,
+                end_line: boundary[1].0,
+                start_offset: boundary[0].1,
+                end_offset: boundary[1].1,
+            })
+            .collect::<Vec<_>>();
+        let pattern = "hit".to_owned();
+        let matcher = SearchMatcher::Literal(Arc::new(memmem::Finder::new(pattern.as_bytes())));
+
+        let match_limited_cancellation = AtomicBool::new(false);
+        let match_limited = search_chunks_parallel(
+            &source.canonical_path,
+            &chunks,
+            &matcher,
+            SearchScanOptions {
+                source_size: source.identity.size,
+                max_line_bytes: 1024,
+                max_content_bytes: 1024,
+            },
+            SearchAccumulator::new(1, 7, 6, 3, 1024),
+            &match_limited_cancellation,
+        )
+        .unwrap()
+        .into_response(false);
+        assert_eq!(
+            match_limited
+                .matches
+                .iter()
+                .map(|found| found.line)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(match_limited.matches[0].content, "hit one");
+        assert_eq!(match_limited.scanned_lines, 5);
+        assert_eq!(match_limited.next_line, Some(6));
+        assert!(match_limited.match_limit_reached);
+
+        let content_limited_cancellation = AtomicBool::new(false);
+        let content_limited = search_chunks_parallel(
+            &source.canonical_path,
+            &chunks,
+            &matcher,
+            SearchScanOptions {
+                source_size: source.identity.size,
+                max_line_bytes: 1024,
+                max_content_bytes: 10,
+            },
+            SearchAccumulator::new(1, 7, 6, 10, 10),
+            &content_limited_cancellation,
+        )
+        .unwrap()
+        .into_response(false);
+        assert_eq!(content_limited.matches.len(), 1);
+        assert_eq!(content_limited.scanned_lines, 2);
+        assert_eq!(content_limited.next_line, Some(3));
+        assert!(content_limited.content_limit_reached);
+
+        let complete_cancellation = AtomicBool::new(false);
+        let complete = search_chunks_parallel(
+            &source.canonical_path,
+            &chunks,
+            &matcher,
+            SearchScanOptions {
+                source_size: source.identity.size,
+                max_line_bytes: 1024,
+                max_content_bytes: 1024,
+            },
+            SearchAccumulator::new(1, 7, 6, 10, 1024),
+            &complete_cancellation,
+        )
+        .unwrap()
+        .into_response(false);
+        assert_eq!(
+            complete
+                .matches
+                .iter()
+                .map(|found| found.line)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5, 6]
+        );
+        assert_eq!(complete.scanned_lines, 6);
+        assert!(complete.eof);
+        assert!(complete.lossy_utf8);
+    }
+
+    #[test]
+    fn search_handles_lines_crossing_reader_buffers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("long-line.log");
+        let mut content = vec![b'x'; SEARCH_READER_BYTES - 1];
+        content.extend_from_slice(b"\r\nneedle");
+        std::fs::write(&source_path, &content).unwrap();
+        let source = index::inspect_source(&source_path).unwrap();
+        let matcher = SearchMatcher::Literal(Arc::new(memmem::Finder::new(b"needle")));
+        let chunk = SearchChunk {
+            start_line: 1,
+            end_line: 3,
+            start_offset: 0,
+            end_offset: source.identity.size,
+        };
+        let cancellation = AtomicBool::new(false);
+        let mut accumulator = SearchAccumulator::new(1, 3, 2, 10, 1024);
+        let options = SearchScanOptions {
+            source_size: source.identity.size,
+            max_line_bytes: SEARCH_READER_BYTES + 1,
+            max_content_bytes: 1024,
+        };
+        let status = scan_search_chunk(
+            &source.canonical_path,
+            chunk,
+            &matcher,
+            options,
+            &cancellation,
+            |event| accumulator.accept(event),
+        )
+        .unwrap();
+        assert_eq!(status, SearchScanStatus::Complete);
+        accumulator.complete_chunk(chunk.end_line);
+        let response = accumulator.into_response(false);
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].line, 2);
+        assert_eq!(response.matches[0].content, "needle");
+        assert_eq!(response.scanned_lines, 2);
+        assert!(response.eof);
+
+        let error = scan_search_chunk(
+            &source.canonical_path,
+            chunk,
+            &matcher,
+            SearchScanOptions {
+                max_line_bytes: SEARCH_READER_BYTES,
+                ..options
+            },
+            &cancellation,
+            |_| Ok(true),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("line 1 exceeds max-line-bytes"));
+    }
+
+    #[test]
+    fn end_to_end_parallel_search_matches_single_thread_results() {
+        const LINE_BYTES: usize = 256;
+        const LINE_COUNT: u64 = 70_000;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("parallel-large.log");
+        let mut content = Vec::with_capacity(LINE_BYTES * LINE_COUNT as usize);
+        for line in 1..=LINE_COUNT {
+            let mut line_bytes = [b'x'; LINE_BYTES];
+            if line % 17_000 == 0 {
+                line_bytes[..6].copy_from_slice(b"needle");
+            }
+            line_bytes[LINE_BYTES - 1] = b'\n';
+            content.extend_from_slice(&line_bytes);
+        }
+        content.pop();
+        std::fs::write(&source_path, content).unwrap();
+
+        let source = index::inspect_source(&source_path).unwrap();
+        let index_config = IndexConfig {
+            directory: temp.path().join("indexes"),
+            checkpoint_bytes: 1024 * 1024,
+        };
+        let progress = BuildProgress::new(CancellationToken::new());
+        let line_index = index::build_or_load(&source, &index_config, &progress, false).unwrap();
+        let opened = OpenedFile {
+            source,
+            index: Arc::new(line_index),
+        };
+        let request = SearchLinesRequest {
+            pattern: "needle".to_owned(),
+            start_line: 1,
+            max_scan_lines: u64::MAX,
+            max_matches: Some(100),
+            regex: Some(false),
+            case_sensitive: Some(true),
+        };
+
+        let single_cancellation = AtomicBool::new(false);
+        let single = search_lines_blocking(
+            &opened,
+            request.clone(),
+            100,
+            LINE_BYTES,
+            1024 * 1024,
+            1,
+            &single_cancellation,
+        )
+        .unwrap();
+        let parallel_cancellation = AtomicBool::new(false);
+        let parallel = search_lines_blocking(
+            &opened,
+            request,
+            100,
+            LINE_BYTES,
+            1024 * 1024,
+            4,
+            &parallel_cancellation,
+        )
+        .unwrap();
+
+        assert_eq!(parallel.scanned_lines, single.scanned_lines);
+        assert_eq!(parallel.next_line, single.next_line);
+        assert_eq!(parallel.eof, single.eof);
+        assert_eq!(parallel.scan_limit_reached, single.scan_limit_reached);
+        assert_eq!(parallel.lossy_utf8, single.lossy_utf8);
+        assert_eq!(parallel.matches.len(), single.matches.len());
+        for (parallel_match, single_match) in parallel.matches.iter().zip(&single.matches) {
+            assert_eq!(parallel_match.line, single_match.line);
+            assert_eq!(parallel_match.content, single_match.content);
+        }
+    }
+
     #[tokio::test]
     async fn opens_reads_searches_and_exports() {
         let temp = tempfile::tempdir().unwrap();
@@ -1043,7 +1894,8 @@ mod tests {
             export_root: std::fs::canonicalize(temp.path()).unwrap(),
             checkpoint_bytes: 16,
             max_read_lines: 100,
-            max_search_lines: 100,
+            search_threads: 4,
+            search_memory_budget_bytes: 1024 * 1024 * 1024,
             max_matches: 100,
             max_content_bytes: 1024 * 1024,
             max_line_bytes: 1024 * 1024,
@@ -1107,6 +1959,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(literal.matches.len(), 2);
+
+        let unlimited_server_range = engine
+            .search_lines(SearchLinesRequest {
+                pattern: "alpha".to_owned(),
+                start_line: 1,
+                max_scan_lines: u64::MAX,
+                max_matches: Some(10),
+                regex: Some(false),
+                case_sensitive: Some(true),
+            })
+            .await
+            .unwrap();
+        assert_eq!(unlimited_server_range.scanned_lines, 5);
+        assert!(unlimited_server_range.eof);
 
         let exported = engine
             .export_lines(ExportLinesRequest {

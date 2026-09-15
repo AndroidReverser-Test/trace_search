@@ -75,7 +75,7 @@ impl TraceSearchServer {
 
     #[tool(
         name = "search_lines",
-        description = "Search at most max_scan_lines beginning at one-based start_line. regex=false uses a precompiled literal search; regex=true uses Rust regex syntax."
+        description = "Search the caller-provided max_scan_lines range beginning at one-based start_line using parallel indexed chunks. regex=false uses a precompiled literal search; regex=true uses Rust regex syntax."
     )]
     async fn search_lines(
         &self,

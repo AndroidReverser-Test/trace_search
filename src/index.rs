@@ -2,7 +2,7 @@ use std::{
     fs::{File, Metadata, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::UNIX_EPOCH,
 };
 
@@ -35,7 +35,7 @@ pub enum IndexError {
     Corrupt(String),
     #[error("the source file changed while it was being used")]
     SourceChanged,
-    #[error("index construction was cancelled")]
+    #[error("operation was cancelled")]
     Cancelled,
     #[error("another process is already building this index")]
     Busy,
@@ -499,6 +499,27 @@ pub fn open_random(path: &Path) -> io::Result<File> {
 }
 
 pub fn locate_line_offset(file: &mut File, index: &LineIndex, target_line: u64) -> Result<u64> {
+    locate_line_offset_inner(file, index, target_line, None)
+}
+
+pub(crate) fn locate_line_offset_cancellable(
+    file: &mut File,
+    index: &LineIndex,
+    target_line: u64,
+    cancellation: &AtomicBool,
+) -> Result<u64> {
+    locate_line_offset_inner(file, index, target_line, Some(cancellation))
+}
+
+fn locate_line_offset_inner(
+    file: &mut File,
+    index: &LineIndex,
+    target_line: u64,
+    cancellation: Option<&AtomicBool>,
+) -> Result<u64> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(IndexError::Cancelled);
+    }
     if target_line == index.line_count.saturating_add(1) {
         return Ok(index.source_size);
     }
@@ -520,6 +541,9 @@ pub fn locate_line_offset(file: &mut File, index: &LineIndex, target_line: u64) 
     let mut buffer = vec![0_u8; LOCATE_BUFFER_BYTES];
 
     loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(IndexError::Cancelled);
+        }
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
             return Err(IndexError::Corrupt(format!(
@@ -732,7 +756,7 @@ fn decode_record(bytes: &[u8; RECORD_LEN]) -> Result<IndexEntry> {
     })
 }
 
-fn open_sequential(path: &Path) -> io::Result<File> {
+pub(crate) fn open_sequential(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -867,6 +891,11 @@ mod tests {
             locate_line_offset(&mut file, &loaded, 6).unwrap(),
             source.identity.size
         );
+        let cancellation = AtomicBool::new(true);
+        assert!(matches!(
+            locate_line_offset_cancellable(&mut file, &loaded, 3, &cancellation),
+            Err(IndexError::Cancelled)
+        ));
     }
 
     #[test]

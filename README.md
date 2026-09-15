@@ -100,7 +100,7 @@ MCP 地址：`http://127.0.0.1:8080/mcp`
 }
 ```
 
-`next_line` 可用于分页继续搜索。字面量且区分大小写时使用预编译 SIMD `memmem`；其他模式使用 Rust regex 引擎，不存在灾难性回溯。
+`next_line` 可用于分页继续搜索。搜索范围完全由调用方传入的 `max_scan_lines` 决定，没有额外的服务端行数上限。`scanned_lines` 表示按行序确认完成的逻辑前缀；并行线程可能已预读后续分块。字面量且区分大小写时使用预编译 SIMD `memmem`；其他模式使用 Rust regex 引擎，不存在灾难性回溯。
 
 ### `export_lines`
 
@@ -127,7 +127,8 @@ MCP 地址：`http://127.0.0.1:8080/mcp`
 - 每条记录 20 字节，索引主体约 2 MiB。
 - 行号定位先在内存中二分检查点，再扫描最多约 8 MiB；超长单行可能突破这个距离。
 - 首次索引只顺序读取文件一次，使用 32 MiB 缓冲、SIMD 换行计数和 Windows 顺序读取提示。
-- 任意正则无法预先建立通用内容索引，因此搜索会快速定位起始行，再严格顺序扫描 `max_scan_lines` 指定的范围。
+- 任意正则无法预先建立通用内容索引。搜索会定位范围首尾，并利用已有行边界检查点把范围切成近似等字节块，由多个独立文件句柄并行顺序扫描。
+- 每个搜索工作线程复用已编译匹配器；普通行直接在 4 MiB 读取缓冲的切片上匹配，仅跨缓冲行和命中行发生复制。结果通过有序同步通道归并，返回顺序、`next_line` 和各项响应上限与单线程语义一致。
 - 导出只定位首尾字节偏移，然后用 8 MiB 缓冲流式复制，不占用与导出大小成比例的内存。
 
 可通过 `--checkpoint-bytes` 调整空间和随机定位 I/O 的权衡。NVMe 场景可使用 4-16 MiB；机械盘可使用 16-64 MiB 来减小索引记录数量。
@@ -141,7 +142,8 @@ MCP 地址：`http://127.0.0.1:8080/mcp`
 | `--checkpoint-bytes` | `TRACE_SEARCH_CHECKPOINT_BYTES` | `8388608` |
 | `--export-root` | `TRACE_SEARCH_EXPORT_ROOT` | 当前目录 |
 | `--max-read-lines` | `TRACE_SEARCH_MAX_READ_LINES` | `100000` |
-| `--max-search-lines` | `TRACE_SEARCH_MAX_SEARCH_LINES` | `10000000` |
+| `--search-threads` | `TRACE_SEARCH_THREADS` | `0`（自动，最多 8） |
+| `--search-memory-budget-bytes` | `TRACE_SEARCH_MEMORY_BUDGET_BYTES` | `1073741824` |
 | `--max-matches` | `TRACE_SEARCH_MAX_MATCHES` | `10000` |
 | `--max-content-bytes` | `TRACE_SEARCH_MAX_CONTENT_BYTES` | `16777216` |
 | `--max-line-bytes` | `TRACE_SEARCH_MAX_LINE_BYTES` | `67108864` |
@@ -151,6 +153,8 @@ MCP 地址：`http://127.0.0.1:8080/mcp`
 | `--allowed-host` | `TRACE_SEARCH_ALLOWED_HOSTS` | 本地地址 |
 | `--allowed-origin` | `TRACE_SEARCH_ALLOWED_ORIGINS` | 不校验 Origin |
 
+`--search-threads=0` 会按可用 CPU 自动选择且最多使用 8 个线程；显式值必须在 `1..=32`。实际线程数还会按搜索内存预算、`--query-concurrency`、读取缓冲、`--max-line-bytes` 和 `--max-content-bytes` 自动下调，极端配置下仍至少保留一个线程。HTTP 请求被取消后，取消信号会传递到搜索线程，且查询并发许可会保留到后台 I/O 实际结束。
+
 运行 `trace-search-mcp --help` 查看完整参数。
 
 ## 一致性与限制
@@ -159,7 +163,7 @@ MCP 地址：`http://127.0.0.1:8080/mcp`
 - 文件被视为不可变快照。大小或修改时间变化后，查询会失败，必须重新 `open_file` 建立新索引。
 - 内容按 UTF-8 返回；非法字节使用替换字符并设置 `lossy_utf8=true`。索引和字面量匹配仍基于原始字节。
 - `search_lines` 对单行大小有限制，避免异常单行耗尽内存；`read_lines` 和 `export_lines` 仍可定位或导出超长行。
-- 多个并发查询可能使机械盘频繁寻道，可将 `--query-concurrency` 调低到 `1`。
+- 多线程搜索或多个并发查询可能使机械盘频繁寻道，可将 `--search-threads` 和 `--query-concurrency` 都调低到 `1`。
 - 非本地监听默认必须配置 Bearer Token。跨主机部署应在反向代理上启用 TLS，因为明文 HTTP 会暴露 Token 和文件内容。
 
 ## 验证
