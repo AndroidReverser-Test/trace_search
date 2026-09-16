@@ -5,7 +5,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, sync_channel},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
     time::Instant,
 };
@@ -23,6 +23,8 @@ use crate::index::{self, BuildProgress, IndexConfig, IndexError, LineIndex, Sour
 
 const SEARCH_READER_BYTES: usize = 4 * 1024 * 1024;
 const MIN_PARALLEL_SEARCH_BYTES: u64 = 8 * 1024 * 1024;
+const SEARCH_RESULT_BATCH_BYTES: usize = 64 * 1024;
+const SEARCH_RESULT_BATCH_EVENTS: usize = 64;
 const EXPORT_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const REGEX_COMPILED_SIZE_LIMIT: usize = 16 * 1024 * 1024;
 pub const MAX_SEARCH_THREADS: usize = 32;
@@ -784,8 +786,17 @@ enum SearchEvent {
     },
 }
 
+impl SearchEvent {
+    fn content_bytes(&self) -> usize {
+        match self {
+            Self::Match { content, .. } => content.len(),
+            Self::OversizedMatch { .. } => 0,
+        }
+    }
+}
+
 enum SearchWorkerEvent {
-    Search(SearchEvent),
+    Batch(Vec<SearchEvent>),
     Complete,
     Error(EngineError),
 }
@@ -1135,6 +1146,8 @@ fn search_chunks_parallel(
             receivers.push(receiver);
             let matcher = matcher.clone();
             scope.spawn(move || {
+                let mut batch = Vec::with_capacity(SEARCH_RESULT_BATCH_EVENTS);
+                let mut batch_bytes = 0_usize;
                 let result = scan_search_chunk(
                     source_path,
                     chunk,
@@ -1145,7 +1158,15 @@ fn search_chunks_parallel(
                         if cancellation.load(Ordering::Relaxed) {
                             return Ok(false);
                         }
-                        Ok(sender.send(SearchWorkerEvent::Search(event)).is_ok())
+                        batch_bytes = batch_bytes.saturating_add(event.content_bytes());
+                        batch.push(event);
+                        if batch.len() >= SEARCH_RESULT_BATCH_EVENTS
+                            || batch_bytes >= SEARCH_RESULT_BATCH_BYTES
+                        {
+                            batch_bytes = 0;
+                            return Ok(send_search_batch(&sender, &mut batch));
+                        }
+                        Ok(true)
                     },
                 );
                 if cancellation.load(Ordering::Relaxed) {
@@ -1153,10 +1174,18 @@ fn search_chunks_parallel(
                 }
                 match result {
                     Ok(SearchScanStatus::Complete) => {
+                        if !send_search_batch(&sender, &mut batch) {
+                            return;
+                        }
                         let _ = sender.send(SearchWorkerEvent::Complete);
                     }
-                    Ok(SearchScanStatus::Stopped) => {}
+                    Ok(SearchScanStatus::Stopped) => {
+                        let _ = send_search_batch(&sender, &mut batch);
+                    }
                     Err(error) => {
+                        if !send_search_batch(&sender, &mut batch) {
+                            return;
+                        }
                         let _ = sender.send(SearchWorkerEvent::Error(error));
                     }
                 }
@@ -1170,6 +1199,14 @@ fn search_chunks_parallel(
     })
 }
 
+fn send_search_batch(sender: &SyncSender<SearchWorkerEvent>, batch: &mut Vec<SearchEvent>) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
+    let events = std::mem::replace(batch, Vec::with_capacity(SEARCH_RESULT_BATCH_EVENTS));
+    sender.send(SearchWorkerEvent::Batch(events)).is_ok()
+}
+
 fn consume_search_workers(
     chunks: &[SearchChunk],
     receivers: &[Receiver<SearchWorkerEvent>],
@@ -1179,9 +1216,11 @@ fn consume_search_workers(
     for (&chunk, receiver) in chunks.iter().zip(receivers) {
         loop {
             match receiver.recv() {
-                Ok(SearchWorkerEvent::Search(event)) => {
-                    if !accumulator.accept(event)? {
-                        return Ok(());
+                Ok(SearchWorkerEvent::Batch(events)) => {
+                    for event in events {
+                        if !accumulator.accept(event)? {
+                            return Ok(());
+                        }
                     }
                 }
                 Ok(SearchWorkerEvent::Complete) => {
@@ -1254,18 +1293,58 @@ where
         let available_len = available.len();
         let mut segment_start = 0_usize;
         let mut completed = false;
+        let mut literal_matches = match matcher {
+            SearchMatcher::Literal(finder) => Some(finder.find_iter(available).peekable()),
+            SearchMatcher::Regex(_) => None,
+        };
+        let literal_needle_len = match matcher {
+            SearchMatcher::Literal(finder) => Some(finder.needle().len()),
+            SearchMatcher::Regex(_) => None,
+        };
         for newline in memchr_iter(b'\n', available) {
             let segment_end = newline + 1;
             let keep_scanning = if partial_line.is_empty() {
                 let line = &available[segment_start..segment_end];
                 ensure_search_line_size(line.len(), line_number, options.max_line_bytes)?;
-                emit_search_line(
-                    line,
-                    line_number,
-                    matcher,
-                    options.max_content_bytes,
-                    &mut emit,
-                )?
+                if let Some(matches) = literal_matches.as_mut() {
+                    let content_bytes = without_line_ending(line);
+                    let content_start = segment_start;
+                    let content_end = content_start + content_bytes.len();
+                    let needle_len = literal_needle_len.expect("literal matcher length");
+                    let mut matched = false;
+                    while let Some(&candidate) = matches.peek() {
+                        if candidate < content_start {
+                            matches.next();
+                            continue;
+                        }
+                        if candidate >= content_end {
+                            break;
+                        }
+                        matches.next();
+                        if candidate + needle_len <= content_end {
+                            matched = true;
+                        }
+                        break;
+                    }
+                    if matched {
+                        emit_matched_search_line(
+                            content_bytes,
+                            line_number,
+                            options.max_content_bytes,
+                            &mut emit,
+                        )?
+                    } else {
+                        true
+                    }
+                } else {
+                    emit_search_line(
+                        line,
+                        line_number,
+                        matcher,
+                        options.max_content_bytes,
+                        &mut emit,
+                    )?
+                }
             } else {
                 append_search_line_bytes(
                     &mut partial_line,
@@ -1365,6 +1444,18 @@ where
         return Ok(true);
     }
 
+    emit_matched_search_line(content_bytes, line, max_content_bytes, emit)
+}
+
+fn emit_matched_search_line<F>(
+    content_bytes: &[u8],
+    line: u64,
+    max_content_bytes: usize,
+    emit: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(SearchEvent) -> Result<bool>,
+{
     let (content, lossy_utf8) = match std::str::from_utf8(content_bytes) {
         Ok(content) => {
             if content.len() > max_content_bytes {
@@ -1747,6 +1838,94 @@ mod tests {
         assert_eq!(complete.scanned_lines, 6);
         assert!(complete.eof);
         assert!(complete.lossy_utf8);
+    }
+
+    #[test]
+    fn literal_chunk_candidates_preserve_line_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("literal-boundaries.log");
+        let content = b"alpha\r\nbeta alpha\ninside\rcarriage\nalpha\r\nlast alpha";
+        std::fs::write(&source_path, content).unwrap();
+        let source = index::inspect_source(&source_path).unwrap();
+        let chunk = SearchChunk {
+            start_line: 1,
+            end_line: 6,
+            start_offset: 0,
+            end_offset: source.identity.size,
+        };
+        let options = SearchScanOptions {
+            source_size: source.identity.size,
+            max_line_bytes: 1024,
+            max_content_bytes: 1024,
+        };
+
+        for pattern in [b"alpha".as_slice(), b"\r", b"\n", b"alpha\r"] {
+            let matcher = SearchMatcher::Literal(Arc::new(memmem::Finder::new(pattern)));
+            let cancellation = AtomicBool::new(false);
+            let mut actual = Vec::new();
+            let status = scan_search_chunk(
+                &source.canonical_path,
+                chunk,
+                &matcher,
+                options,
+                &cancellation,
+                |event| {
+                    if let SearchEvent::Match { line, .. } = event {
+                        actual.push(line);
+                    }
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(status, SearchScanStatus::Complete);
+
+            let finder = memmem::Finder::new(pattern);
+            let expected = content
+                .split(|&byte| byte == b'\n')
+                .enumerate()
+                .filter_map(|(line, bytes)| {
+                    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+                    finder.find(bytes).is_some().then_some(line as u64 + 1)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "pattern={pattern:?}");
+        }
+    }
+
+    #[test]
+    fn batched_parallel_results_precede_later_worker_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("batched-error.log");
+        std::fs::write(&source_path, b"hit\nline-too-long\n").unwrap();
+        let source = index::inspect_source(&source_path).unwrap();
+        let chunks = [SearchChunk {
+            start_line: 1,
+            end_line: 3,
+            start_offset: 0,
+            end_offset: source.identity.size,
+        }];
+        let matcher = SearchMatcher::Literal(Arc::new(memmem::Finder::new(b"hit")));
+        let cancellation = AtomicBool::new(false);
+
+        let response = search_chunks_parallel(
+            &source.canonical_path,
+            &chunks,
+            &matcher,
+            SearchScanOptions {
+                source_size: source.identity.size,
+                max_line_bytes: 4,
+                max_content_bytes: 1024,
+            },
+            SearchAccumulator::new(1, 3, 2, 1, 1024),
+            &cancellation,
+        )
+        .unwrap()
+        .into_response(false);
+
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].line, 1);
+        assert_eq!(response.next_line, Some(2));
+        assert!(response.match_limit_reached);
     }
 
     #[test]

@@ -128,7 +128,7 @@ MCP 地址：`http://127.0.0.1:8080/mcp`
 - 行号定位先在内存中二分检查点，再扫描最多约 8 MiB；超长单行可能突破这个距离。
 - 首次索引只顺序读取文件一次，使用 32 MiB 缓冲、SIMD 换行计数和 Windows 顺序读取提示。
 - 任意正则无法预先建立通用内容索引。搜索会定位范围首尾，并利用已有行边界检查点把范围切成近似等字节块，由多个独立文件句柄并行顺序扫描。
-- 每个搜索工作线程复用已编译匹配器；普通行直接在 4 MiB 读取缓冲的切片上匹配，仅跨缓冲行和命中行发生复制。结果通过有序同步通道归并，返回顺序、`next_line` 和各项响应上限与单线程语义一致。
+- 每个搜索工作线程复用已编译匹配器；区分大小写的字面量搜索会先在整个 4 MiB 读取缓冲中批量枚举候选，再按行边界过滤，避免为每个短行重新启动匹配器。正则仍保持逐行语义，仅跨缓冲行和命中行发生复制。结果通过有界小批次有序归并，返回顺序、`next_line` 和各项响应上限与单线程语义一致。
 - 导出只定位首尾字节偏移，然后用 8 MiB 缓冲流式复制，不占用与导出大小成比例的内存。
 
 可通过 `--checkpoint-bytes` 调整空间和随机定位 I/O 的权衡。NVMe 场景可使用 4-16 MiB；机械盘可使用 16-64 MiB 来减小索引记录数量。
@@ -173,6 +173,14 @@ cargo fmt --all --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo build --release
+```
+
+可选的真实文件 release 基准：
+
+```powershell
+$env:TRACE_SEARCH_BENCH_FILE = "D:\logs\trace.log"
+$env:TRACE_SEARCH_BENCH_THREADS = "1,2,4,8"
+cargo test --release --test search_bench -- --ignored --nocapture
 ```
 
 更详细的索引格式、状态机和复杂度说明见 [DESIGN.md](DESIGN.md)。
